@@ -1,43 +1,26 @@
 import { credentials } from "./credentials.js";
 import { CustomLocalStorage } from "../../spotify-util/js/customLocalStorage.js";
 
-const CURRENT_VERSION = "0.0.1";
-const REFRESH_RATE = { //used to control API rate limiting
-    getUserPlaylists: 1,
-    getPlaylistTracks: 250,
-    addTracksToPlaylist: 150
-};
+const CURRENT_VERSION = "0.0.9";
 const USER_OPTIONS = {
-    allow_explicits:true,
     allow_duplicates:false,
-    include_private:false,
-    include_collaborative:false,
-    include_followed:false,
-    include_christmas:false,
     setOption: function (option_name, option_value) {
         //if(!option_name || !option_value) return false;
         if (this[option_name] !== undefined) return this[option_name] = option_value;
     },
     resetOptions: function () {
-        this.allow_explicits = true;
         this.allow_duplicates = false;
-        this.include_private = false;
-        this.include_collaborative = false;
-        this.include_followed = false;
-        this.include_christmas = false;
     }
 };
 
 //some global variables
 var customLocalStorage  = new CustomLocalStorage('playlistscrobbler');
-window.customLocalStorage = customLocalStorage;
 var spotify_credentials = null;
 var lastfm_credentials  = null;
 var CURRENTLY_RUNNING   = false;
-var playlist_title      = "Huge Combination Playlist";
-var playlist_objects    = [];
+var tracks_scrobbled    = [];
+var tracks_ignored      = [];
 var database;
-var global_playlist_tracks = [];
 
 const callSpotify = function (url, data) {
     if(!spotify_credentials) return new Promise((resolve, reject) => reject("no spotify_credentials"));
@@ -50,82 +33,20 @@ const callSpotify = function (url, data) {
     });
 };
 
-const callLastfm = function (url, data) {
-    
-};
-
-const postSpotify = function (url, json, callback) {
-    $.ajax(url, {
-        type: "POST",
-        data: JSON.stringify(json),
+const postLastfm = function (data) {
+    data = {
+        ...data,
+        api_key: credentials.lastfm.key,
+        sk: lastfm_credentials.session_key,
+        method: 'track.scrobble'
+    };
+    data.api_sig = md5(Object.entries(data).sort(/*default method sorts subarrays too apparently, that's cool*/).map((subarr) => subarr.join('')).join('') + credentials.lastfm.secret);
+    data.format = 'json';   //this cannot be included in the api_sig
+    return $.ajax(`http://ws.audioscrobbler.com/2.0/`, {
+        type: 'POST',
         dataType: 'json',
-        headers: {
-            'Authorization': 'Bearer ' + spotify_credentials.token,
-            'Content-Type': 'application/json'
-        },
-        success: function (r) {
-            callback(true, r);
-        },
-        error: function (r) {
-            // 2XX status codes are good, but some have no
-            // response data which triggers the error handler
-            // convert it to goodness.
-            if (r.status >= 200 && r.status < 300) {
-                callback(true, r);
-            } else {
-                callback(false, r);
-            }
-        }
+        data: data
     });
-};
-
-const deleteSpotify = function (url, callback) {
-    $.ajax(url, {
-        type: "DELETE",
-        //data: JSON.stringify(json),
-        dataType: 'json',
-        headers: {
-            'Authorization': 'Bearer ' + spotify_credentials.token,
-            'Content-Type': 'application/json'
-        },
-        success: function (r) {
-            callback(true, r);
-        },
-        error: function (r) {
-            // 2XX status codes are good, but some have no
-            // response data which triggers the error handler
-            // convert it to goodness.
-            if (r.status >= 200 && r.status < 300) {
-                callback(true, r);
-            } else {
-                callback(false, r);
-            }
-        }
-    });
-};
-
-/**
- * Shuffles an array and does not modify the original.
- * 
- * @param {array} array - An array to shuffle.
- * @return {array} A shuffled array.
- */
-const shuffleArray = function (array) {
-    //modified from https://javascript.info/task/shuffle
-
-    let tmpArray = [...array];
-
-    for (let i = tmpArray.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1)); // random RESPONSE_INDEX from 0 to i
-
-        // swap elements tmpArray[i] and tmpArray[j]
-        // we use "destructuring assignment" syntax to achieve that
-        // you'll find more details about that syntax in later chapters
-        // same can be written as:
-        // let t = tmpArray[i]; tmpArray[i] = tmpArray[j]; tmpArray[j] = t
-        [tmpArray[i], tmpArray[j]] = [tmpArray[j], tmpArray[i]];
-    }
-    return tmpArray;
 };
 
 const okToRecursivelyFix = function (error_obj) {
@@ -242,7 +163,7 @@ const checkSpotifyToken = async function () {
 
     if (spotify_credentials?.expires > getTime()) {
         console.log("found unexpired spotify token!");
-        location.hash = ''; //clear the hash just in case (this can be removed later)
+        if(!!location.hash) location.hash = ''; //clear the hash just in case 
         return true;
     } else {
         // we have a spotify token as a hash parameter in the url
@@ -296,8 +217,8 @@ const checkLastfmToken = async function () {
         lastfm_credentials = customLocalStorage.getItem('lastfm_credentials');
             
         if(lastfm_credentials?.session_key) {
-            console.log("found unexpired lastfm token!");
-            location.search = ''; //clear the query in case user shares link w token
+            console.log("found unexpired lastfm session key!");
+            if(!!location.search) location.search = ''; //clear the query in case user shares link w token
             return true;
         }
 
@@ -356,75 +277,43 @@ const resolvePromiseArray = function (promise_array, callback) {
 };
 
 /**
- * Checks a playlist against the global user options
- * 
- * @param {object} playlist_obj - A simplified playlist object to check
- * @return {boolean} Whether the playlist passes the check or not
+ * checks playlist input to ensure it contains a playlist id 
+ * @param {string} input String to check
+ * @returns {Boolean} True if string contains a playlist id, false if not
  */
-const checkPlaylist = function (playlist_obj = {}) {
-    if(playlist_obj.collaborative == undefined || playlist_obj.owner == undefined || playlist_obj.public == undefined) return false;
-    if(playlist_obj.tracks.total < 1) return false; //no need to get the tracks of a playlist if there aren't any there
-
-    const isChristmas = (playlist) => {
-        let name = playlist.name.toLowerCase(),
-            description = playlist.description.toLowerCase();
-        if(name.includes("christmas") || name.includes("xmas") || description.includes("christmas") || description.includes("xmas")) return true;
-        return false;
-    };
-    if(!USER_OPTIONS.include_christmas && isChristmas(playlist_obj)) return false;
-    //if playlist is public, return true (universal implication)
-    if(playlist_obj.public) return true;
-    //if user says no privates and this is their playlist and playlist is not public (private)
-    if(!USER_OPTIONS.include_private && playlist_obj.owner.id == spotify_credentials.uid && !playlist_obj.public) return false;
-    //if user says no collab and this is their playlist and playlist is collaborative
-    if(!USER_OPTIONS.include_collaborative && playlist_obj.owner.id == spotify_credentials.uid && playlist_obj.collaborative) return false;
-    //if user says no followed, and they are not the owner of the playlist
-    if(!USER_OPTIONS.include_followed && playlist_obj.owner.id != spotify_credentials.uid) return false;
-    return true;    //passed all tests
+const checkInput = function (input) {
+    input = input.toString().trim();   //remove whitespace
+    if((input.startsWith('http') && input.includes('open.spotify.com') && input.includes('/playlist/')) ||
+       (input.startsWith('open.spotify.com') && input.includes('/playlist/')) ||
+        input.startsWith('spotify:playlist:')) return true;
+    return false;
 };
 
-const getUserPlaylists = function () {
-    //retrieves the playlists of the currently logged in user and checks them against
-    //global options. stores the hrefs of playlist track list in a global array
-
-    const recursivelyGetAllPlaylists = function (url) {
-        return new Promise((resolve, reject) => {
-            callSpotify(url).then(async res => {
-                res.items.forEach((playlist, index) => {
-                    if(checkPlaylist(playlist)) {
-                        playlist_objects.push(playlist);
-                    }
-                    progressBarHandler({current_operation:index + res.offset + 1, total_operations:res.total, stage:1});
-                });
-                
-                //if we have more playlists to get...
-                if(res.next) await recursivelyGetAllPlaylists(res.next);
-                //await should wait until all promises complete
-                resolve("finished with getUserPlaylists");
-            }).catch(err => {
-                console.log("error in getUserPlaylists... attempting to fix recursively", err);
-                if (okToRecursivelyFix(err)) return new Promise((resolve, reject) => {
-                        setTimeout(() => resolve(recursivelyGetAllPlaylists(url)), 500); //wait half a second before calling api again
-                    }) //.then(res=>resolve(res)).catch(err=>reject(err)); //this needs to be at the end of every nested promise
-                    .then(res => res).catch(err => err); //we have to return the vals because we're not in a promise atm, we're in a .catch callback
-                else return err; //do something for handling errors and displaying it to the user
-            });
-        });
-    }
-
-    //the recursive function returns a promise
-    return recursivelyGetAllPlaylists("https://api.spotify.com/v1/me/playlists?limit=50");
+/**
+ * Extracts the playlist id from a string
+ * @param {string} input String that has passed the `checkInput()` function
+ * @returns {string} A Spotify playlist ID
+ */
+const getId = function getIdFromPlaylistInput(input) {
+    //function assumes input passed the checkInput function
+    input = input.toString().trim();
+    let id = undefined; //default to undefined for error handling
+    //if we have a url
+    if(input.startsWith('http') || input.includes('open.spotify.com')) id = input.split('/').pop().split('?')[0];
+    //if we have a uri
+    else if(input.startsWith('spotify:playlist:')) id = input.split(':').pop(); //even though .pop() is somewhat inefficent, its less practical to get the length of the array and use that as our index
+    return id;
 };
 
 /**
  * Retrieves all tracks from a playlist and adds them to a global array. Ignores local files
  * 
  * @param {string} playlist_id - The ID of the playlist to retrieve tracks from
- * @return {promise} - A promise that resolves with an array of tracks (only uris and explicitness) from the requested playlist
+ * @return {Promise<Array>} - A promise that resolves with an array of tracks (only uris and explicitness) from the requested playlist
  */
-const getAllPlaylistTracks = function (playlist_id) {
+const getPlaylistTracksHandler = function (playlist_id) {
     let options = {
-        fields:"next,items.track(uri,id,explicit,is_local,name,artists,type)",
+        fields:"next,items(added_at,track(uri,id,is_local,name,artists,album,type,duration_ms,track_number))",
         market:"from_token",
         limit:100
     }, playlist_songs = [];
@@ -457,10 +346,14 @@ const getAllPlaylistTracks = function (playlist_id) {
     return recursivelyRetrieveAllPlaylistTracks(`https://api.spotify.com/v1/playlists/${playlist_id}/tracks`, options);
 };
 
+/**
+ * 
+ * @param {string} playlist_id 
+ * @returns {Promise<Array>}
+ */
 const getPlaylistTracks = async function (playlist_id = '') {
-    //returns an array of all the tracks from a single, given playlist
     try {
-        return await getAllPlaylistTracks(playlist_id).then((res_obj) => res_obj.playlist_songs);
+        return await getPlaylistTracksHandler(playlist_id).then((res_obj) => res_obj.playlist_songs);
     } catch (err) {
         console.log(`Error in getPlaylistTracks try-catch block:`, err);
         throw err;
@@ -470,213 +363,174 @@ const getPlaylistTracks = async function (playlist_id = '') {
 /**
  * Filters an array of tracks against a set of global options
  * 
- * @param {array} track_array - The array of tracks to filter
- * @return {array} - A filtered array of tracks
+ * @param {Array} track_array - The array of tracks to filter
+ * @return {Array<Array, Array>} - Two arrays. First one contains the tracks that passed filtration and the second contains tracks that failed.
  */
-const filterTracks = function (track_array = global_playlist_tracks) {
-    //idea is to minimize the amount of work we perform
-    //remove duplicates first that way we aren't filtering thru songs that would've just ended up being removed later on
-    progressBarHandler({current_operation:1, total_operations:2, stage:3});
-    let filtered_array = [...track_array];  //properly copy array
-    if(!USER_OPTIONS.allow_duplicates) filtered_array = filtered_array.reduce((acc, cur) => {
-        !acc.find(v => v.uri === cur.uri) && acc.push(cur);
+const filterTracks = function (track_array = []) {
+    let [filtered_array, rejected_array] = [[...track_array], []];
+    console.log(filtered_array, rejected_array);
+
+    //remove duplicate timestamps
+    filtered_array = filtered_array.reduce((acc, cur) => {
+        //if current track shares a timestamp with a track already in the reduced array, reject it
+        !!acc.find(track => track.added_at === cur.added_at) ? 
+            rejected_array.push({...cur, warning:{title:'Duplicate timestamp', message:'This song has a duplicate timestamp as another song in the playlist. For obvious reasons, it is not possible to listen to two songs at once.'}}) :
+            acc.push(cur);
         return acc;
     }, []);
-    if(!USER_OPTIONS.allow_explicits) filtered_array = filtered_array.filter(track=>!track.explicit);
-    progressBarHandler({current_operation:2, total_operations:2, stage:3});
-    return filtered_array;
+    console.log(filtered_array, rejected_array);
+    //remove tracks older than two weeks
+    filtered_array = filtered_array.reduce((acc, cur) => {
+        const now = new Date();
+        new Date(cur.added_at) < new Date(now.setDate(now.getDate()-14)) ?
+            rejected_array.push({...cur, warning:{title:'Track too old', message:'Per Lastfm regulations, tracks older than two weeks cannot be scrobbled to an account.'}}) :
+            acc.push(cur);
+        return acc;
+    }, []);
+    console.log(filtered_array, rejected_array);
+    //remove duplicate tracks
+    if(!USER_OPTIONS.allow_duplicates) filtered_array = filtered_array.reduce((acc, cur) => {
+        console.log([...acc].pop()?.uri == cur.uri);
+        [...acc].pop()?.track?.uri == cur.track.uri ?
+            rejected_array.push({...cur, warning:{title:'Duplicate track', message:'This track appeared as a back-to-back duplicate and was caught by the Allow Duplicates option'}}) :
+            acc.push(cur);
+        return acc;
+    }, []);
+    console.log(filtered_array, rejected_array);
+    return [filtered_array, rejected_array];
 };
 
-const createPlaylist = function (params = { name: "New Playlist" }) {
-    //create a playlist with the given params, and return the created playlist
-    return new Promise((resolve, reject) => {
-        var url = "https://api.spotify.com/v1/users/" + spotify_credentials.uid + "/playlists";
-        postSpotify(url, params, function (ok, playlist) {
-            if (ok) resolve(playlist);
-            else {
-                console.log("err in createPlaylist... will attempt to recursively fix", playlist);
-                if (okToRecursivelyFix(playlist)) return new Promise((resolve, reject) => {
-                    setTimeout(() => resolve(createPlaylist(params)), 500); //wait half a second before calling api again
-                }).then(res => resolve(res)).catch(err => reject(err)); //this needs to be on the end of every nested promise
-                else reject(playlist); //do something for handling errors and displaying it to the user
-            }
-        });
-    });
-};
-
-const prepTracksForPlaylistAddition = function (track_array = global_playlist_tracks) {
-    //prepares an array of songs for addition to a spotify playlist
-    //by sorting them into arrays of 100 songs each, then returning
-    //an array that contains all of those 100-song arrays
-
-    //shuffle the given array, then truncate it
-    let shuffledArray = shuffleArray(track_array);
-    let tmparry = [];
-    for (let i = 0; i < shuffledArray.length; i++) { //for every element in track_array
-        if (i % 100 == 0) {
-            //console.log(i);
-            //console.log(uri_array);
-            tmparry.push([]); //if we've filled one subarray with 100 songs, create a new subarray
-        }
-        tmparry[tmparry.length - 1].push(shuffledArray[i].uri); //go to the last subarray and add a song
-        //repeat until we've gone thru every song in randomSongArray
+//parse the tracks to be sent to Lastfm's API
+const parseTracks = function (track_array) {
+    let return_data = {};
+    for (let i = 0; i < track_array.length; i++) {
+        const track = track_array[i].track;
+        return_data = {
+            ...return_data,
+            [`track[${i}]`]: track.name,
+            [`artist[${i}]`]: track.artists[0].name,
+            [`timestamp[${i}]`]: new Date(track_array[i].added_at).getTime() / 1000,
+            [`album[${i}]`]: track.album.name,
+            [`duration[${i}]`]: Math.round(track.duration_ms / 1000),
+            [`trackNumber[${i}]`]: track.track_number,
+            [`chosenByUser[${i}]`]: 0
+        };
     }
-    if(tmparry.length > 10000) tmparry.length = 10000;    //truncate
-    return tmparry;
+    return return_data;
 };
 
-const addTracksToPlaylist = function (playlist_obj, uri_array) {
-    //uri_array needs to be less than 101, please make sure you've checked that before
-    //you call this function, otherwise it will err
+//update global variables depending on response of api call
+const checkScrobbleRes = function (res) {
+    //can't iterate over a single response (api restrictions)
+    if(res.scrobbles['@attr']?.accepted === 1 || res.scrobbles['@attr']?.ignored === 1) {
+        const scrobble = res.scrobbles.scrobble;
+        if(scrobble.ignoredMessage.code == 1) 
+            tracks_ignored.push({...scrobble, warning:{title:'Rejected by Last.fm', message:scrobble.ignoredMessage['#text']}});
+        else tracks_scrobbled.push(scrobble);
+        return;
+    }
 
-    //so... what about duplicates?
-    var pid = Math.floor(Math.random() * 999);
-    console.log(`${pid}: attempting to add ${uri_array.length} tracks to playlist ${playlist_obj.name}`);
-    console.log(`${pid}: uri_array:`, uri_array);
-    return new Promise((resolve, reject) => {
-        //let findDuplicates = arr => arr.filter((item, index) => arr.indexOf(item) != index);
-        //var asd = findDuplicates(uri_array).length;
-        //if(asd > 0) {
-        //    console.log(asd +" duplicates found");
-        //    reject({err:"duplicates!!!"});
-        //}
-
-        const url = "https://api.spotify.com/v1/users/" + playlist_obj.owner.id + "/playlists/" + playlist_obj.id + '/tracks';
-        postSpotify(url, {
-            uris: uri_array
-        }, (ok, data) => {
-            data.pid = pid;
-            if (ok) {
-                console.log(`${pid}: successfully added ${uri_array.length} tracks to playlist ${playlist_obj.name}`);
-                //oldProgressBarHandler();
-                resolve({data:data, playlist_obj: playlist_obj, uri_array:uri_array});  //resolve an obj for progressBar purposes
-            } else {
-                console.log(`${pid} error adding ${uri_array.length} tracks to playlist ${playlist_obj.name}.. attempting to fix recursively...`);
-                if (okToRecursivelyFix(data)) return new Promise((resolve, reject) => {
-                    setTimeout(() => resolve(addTracksToPlaylist(playlist_obj, uri_array)), 500); //wait half a second before calling api again
-                }).then(res => resolve(res)).catch(err => reject(err)); //this needs to be at the end of every nested promise
-                else reject(data); //do something for handling errors and displaying it to the user
-            }
-        });
-
-        //resolve("error: bypassed await...");
-    });
+    for (const scrobble of res.scrobbles.scrobble) {
+        if(scrobble.ignoredMessage.code == 1) 
+            tracks_ignored.push({...scrobble, warning:{title:'Rejected by Last.fm', message:scrobble.ignoredMessage['#text']}});
+        else tracks_scrobbled.push(scrobble);
+    }
 };
 
-const addTracksToPlaylistHandler = function (playlist, uri_array) {
-    let pending_addTracksToPlaylist_calls = []; //create a promise array
-    console.log("starting API batch addTracksToPlaylist calls");
-    return new Promise((resolve, reject) => {
-        var uri_batch_index = 0,
-            current_uri_batch,
-            stagger_api_calls = setInterval(() => {
-                current_uri_batch = uri_array[uri_batch_index];
-                if (uri_batch_index >= uri_array.length) { //once we've reached the end of the uri_array
-                    console.log("stopping API batch addTracksToPlaylist calls");
-                    clearInterval(stagger_api_calls);
-                    //resolve all the api calls, then do something with all the resolved calls
-                    //"return" b/c the code will otherwise continue to make anotehr api call
-                    return resolvePromiseArray(pending_addTracksToPlaylist_calls, (err, finished_api_calls) => {
-                        console.log(err, finished_api_calls);
-                        if (err) { // do something if i migrate this to its own function
-                            console.log("error in API batch add function", finished_api_calls);
-                            reject(finished_api_calls);
-                        } //else would be redundant?
-                        finished_api_calls.forEach(res => {
-                            if (!res || !res.snapshot_id) { //if no snapshot... maybe change this to a customErrorKey or something?
-                                console.log("no snapshot found, rejecting promise", res);
-                                reject(finished_api_calls);
-                            }
-                        });
-                        console.log("resolving addTracksToPlaylistHandler promise");
-                        resolve("resolving from inside addTracksToPlaylistHandler");
-                    });
-                }
-                //if we still have more tracks to add:
-                console.log("calling api to addTracksToPlaylist uri_batch number " + uri_batch_index);
-                pending_addTracksToPlaylist_calls.push(addTracksToPlaylist(playlist, current_uri_batch).then(resObj => {
-                    progressBarHandler({ current_operation:uri_array.findIndex(uri_batch => uri_batch == resObj.uri_array)+1, total_operations:uri_array.length, stage:5 });
-                    return resObj.data;
-                })); //no .catch() after addTracksToPlaylist b/c we want the error to appear in the callback, causing a reject to send to our main() function
-                uri_batch_index++;
-            }, REFRESH_RATE.addTracksToPlaylist);
-    });
+const renderScrobbles = function(tracks_scrobbled, tracks_ignored) {
+    for(const item of tracks_ignored) {
+        const track = item.track;
+        $('#track-confirmation').append(`
+            <div class="track-wrapper">
+                <span class="status error" onclick="alert('${item?.warning.message || 'Could not load info'}');" title="Click to view more info">${item?.warning.title || "Not Scrobbled"}</span>
+                <div class="track">
+                    <img src="${track.album?.images[0]?.url || './img/default_playlist_img.jpg'}" alt="Album art for '${track.album.name}'">
+                    <p>
+                        <span id="title">${track.name}</span><br>
+                        by <span id="artist">${track.artists[0].name}</span>
+                    </p>
+                </div>
+            </div>
+        `);
+    }
+    for(const item of tracks_scrobbled) {
+        console.log(item);
+        const track = item.track;
+        $('#track-confirmation').append(`
+            <div class="track-wrapper">
+                <span class="status success">Scrobbled Succesfully</span>
+                <div class="track">
+                    <img src="${track.album?.images[0]?.url || './img/default_playlist_img.jpg'}" alt="Album art for '${track.album.name}'">
+                    <p>
+                        <span id="title">${track.name}</span><br>
+                        by <span id="artist">${track.artists[0].name}</span>
+                    </p>
+                </div>
+            </div>
+        `);
+    }
 };
 
 const main = async function () {
     //reset global stuff
-    playlist_objects = [], global_playlist_tracks = [];
     CURRENTLY_RUNNING = true;
     try {
         //progressBarHandler({remaining_tracks:tracks_to_receive, total_tracks:track_count}); //get a progressbar visual up for the user
         let new_session = database.ref('playlistscrobbler/sessions').push();
         new_session.set({
-            sessionTimestamp:new Date().getTime(),
-            sessionID:new_session.key,
+            sessionTimestamp: new Date().getTime(),
+            sessionID: new_session.key,
             //sessionStatus:"pending",
-            spotifyUID:spotify_credentials.uid,
+            spotifyUID: spotify_credentials.uid,
+            lastfmUser: lastfm_credentials.name,
             userAgent: navigator.userAgent
         }, function (error) {
             if(error) console.log("Firebase error", error);
             else console.log("Firebase data written successfully");
         });
-        console.log("retrieving user playlists...");
-        await getUserPlaylists();   //puts a simplified playlist obj for each playlist the into playlist_objects array
-        console.log("finished retrieving user playlists!", playlist_objects);
-        //now we need to retrieve a random track from each album
-        console.log("retrieving songs from each playlist...");
-        for(let idx=0, playlist_obj=playlist_objects[idx]; idx < playlist_objects.length; playlist_obj=playlist_objects[++idx]) {
-            progressBarHandler({current_operation:idx+1, total_operations:playlist_objects.length, stage:2, playlist_name:playlist_obj.name});
-            let track_res = await getPlaylistTracks(playlist_obj.id);
-            for(const item of track_res) global_playlist_tracks.push(item.track);
-        };
-        console.log("finished retrieving songs from each playlist!", global_playlist_tracks);
+        
+        const raw_playlist_tracks = await getPlaylistTracks(getId(document.getElementById('playlist-url').value));
+        console.log(raw_playlist_tracks);
+        
+        //progressBarHandler({current_operation:1, total_operations:2, stage:3});
+        const [playlist_tracks, rejected_tracks] = filterTracks(raw_playlist_tracks);
+        tracks_ignored.push(...rejected_tracks);
+        //progressBarHandler({current_operation:2, total_operations:2, stage:3});
 
-        console.log("filtering songs based off user's options...");
-        //run checks on the track array
-        let filtered_tracks = filterTracks(global_playlist_tracks);
-        console.log("finished filtering songs", filtered_tracks);
-
-        //time to add the songs to the playlist
-        //first, create the playlist, storing the returned obj locally:
-        console.log("creating new playlist...");
-        progressBarHandler({current_operation:1, total_operations:2, stage:4});
-        //var is intentional so it can be used in catch block
-        var playlist = await createPlaylist({
-            name: playlist_title,
-            description: "A combination of all my other playlists made using www.glassintel.com/elijah/programs/spotifyplaylistscrobbler"
-        });
-        console.log("new playlist succesfully created");
-        progressBarHandler({current_operation:2, total_operations:2, stage:4});
-        //prep songs for addition (make sure there aren't any extras and put them in subarrays of 100)
-        let prepped_uri_array = prepTracksForPlaylistAddition(filtered_tracks);
-        console.log("finished preparing songs for addition to the playlist!", prepped_uri_array);
-        //add them to the playlist
-        console.log("adding songs to playlist...");
-        await addTracksToPlaylistHandler(playlist, prepped_uri_array);
-        console.log("finished adding songs to playlist!");
+        //parse tracks and scrobble them in batches of 50 or less (per lastfm API)
+        let track_batch = [];
+        for (let i = 0; i < playlist_tracks.length; i++) {
+            if(i == 0 || i % 50 != 0) {
+                track_batch.push(playlist_tracks[i]);
+                continue;
+            }
+            console.log(i, track_batch);
+            //we have 50 tracks in the array
+            const parsed_tracks = parseTracks(track_batch);
+            console.log(parsed_tracks);
+            const res = await postLastfm(parsed_tracks);
+            console.log(res);
+            checkScrobbleRes(res);
+            track_batch = [playlist_tracks[i]]; //reset array for next batch
+        }
+        renderScrobbles(tracks_scrobbled, tracks_ignored);
     } catch (e) {
         console.log("try-catch err", e);
-        progressBarHandler({stage: 'error'});  //change progressbar to red
+        //progressBarHandler({stage: 'error'});  //change progressbar to red
         alert("The program enountered an error");
         //"delete" the playlist we just created
-        //playlists are never deleted on spotify. see this article: https://github.com/spotify/web-api/issues/555
-        deleteSpotify(`https://api.spotify.com/v1/playlists/${playlist.id}/followers`, function (ok, res) { //yay nesting callbacks!!
-            if (ok) console.log("playlist succesfully deleted");
-            else console.log(`unable to delete playlist, error: ${res}`);
-        });
         return;
     } finally {
         CURRENTLY_RUNNING = false;
         console.log("execution finished!");
     }
-    progressBarHandler({stage: "done"});    //this is outside of the finally block to ensure it doesn't get executed if we trigger a return statement
+    //progressBarHandler({stage: "done"});    //this is outside of the finally block to ensure it doesn't get executed if we trigger a return statement
 };
 
 $(document).ready(async function () {
     console.log(`Running Spotify Playlist Scrobbler version ${CURRENT_VERSION}\nDeveloped by Elijah O`);
-    //firebase.initializeApp(credentials.firebase.config);
-    //database = firebase.database();
+    firebase.initializeApp(credentials.firebase.config);
+    database = firebase.database();
     await performAuthDance();
 });
 
@@ -686,24 +540,39 @@ $("#lastfm-login-button").click(loginWithLastfm);
 $("#combine-button").click(function () {
     if(CURRENTLY_RUNNING) return alert("Program is already running!");
 
-    //reset all user options to their default
-    USER_OPTIONS.resetOptions();
-
-    //update user options
-    let user_options_array = $('#user-options input:checkbox').map(function () {
-        return {
-            name: this.name,
-            value: this.checked ? true : false
-        };
-    });
-    for (const option of user_options_array) USER_OPTIONS.setOption(option.name, option.value);
-
-    //get the playlist title
-    if ($("#title-input").val() == "") playlist_title = $("#title-input").attr("placeholder"); //user left placeholder title
-    else playlist_title = $("#title-input").val();  //otherwise take the user's title
-
-    $("#progress-bar-wrapper").removeClass("hidden"); //show progress bar
-    progress_bar.set(0);    //reset progressbar
-    //reset global variables
+    //$("#progress-bar-wrapper").removeClass("hidden"); //show progress bar
+    //progress_bar.set(0);    //reset progressbar
     main();
+});
+
+//populates the playlist-info-wrapper with the given user information
+const populateSearchInfo = function (playlist_obj = {}, jQuery_element) {
+    if(playlist_obj.images.length > 0) $(jQuery_element).siblings('.playlist-info-wrapper').children('img').attr('src', playlist_obj.images[0].url);
+    else $(jQuery_element).siblings('.playlist-info-wrapper').children('img').attr('src', './img/default-playlist_img.jpg');
+    $(jQuery_element).siblings('.playlist-info-wrapper').children('p').text(`${playlist_obj.name} - ${playlist_obj.tracks.total} songs`);
+};
+
+$("#playlist-url").on("input", function () {
+    //update the playlist info whenever the field is changed
+    //if($(this).val() == current_input) return;  //prevent unnecessary api calls
+    if($(this).val().trim() == '') return;    //prevent unnecessary api calls
+    const current_input = $(this).val().trim();
+
+    if(!checkInput(current_input)) {
+        $(this).siblings('.playlist-info-wrapper').children('img').attr('src', './img/x-img.png');
+        $(this).siblings('.playlist-info-wrapper').children('p').text('That is not a valid Spotify playlist link');
+    } else {
+        callSpotify(`https://api.spotify.com/v1/playlists/${getId(current_input)}`).then((playlist) => {
+            if(getId(playlist.external_urls.spotify) != getId($(this).val())) return;
+            if(playlist.tracks.total == 0) {
+                $(this).siblings('.playlist-info-wrapper').children('img').attr('src', './img/x-img.png');
+                $(this).siblings('.playlist-info-wrapper').children('p').text('That playlist does not have any tracks in it');
+                return;
+            }
+            populateSearchInfo(playlist, this);
+        }).catch(() => {
+            $(this).siblings('.playlist-info-wrapper').children('img').attr('src', './img/x-img.png');
+            $(this).siblings('.playlist-info-wrapper').children('p').text('That is not a valid Spotify playlist link');
+        });
+    }
 });
